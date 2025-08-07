@@ -290,4 +290,6 @@ class FlightSimulatorGUI:
 
 # ───────────── RUN ───────────────────────────────────────────────────────
 if __name__ == "__main__":
-    root = tk.Tk(); FlightSimulatorGUI(root); root.mainloop()
+    root = tk.Tk()
+    FlightSimulatorGUI(root)
+    root.mainloop()
