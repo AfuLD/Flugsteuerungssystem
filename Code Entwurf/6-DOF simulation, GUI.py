@@ -119,10 +119,12 @@ def _build_params_from_md(name: str):
     CL0 = CL1 - CLa*alpha0
     CD0 = max(1e-3, CD1 - k_ind*(CL1**2))
 
+    Cm0 = -Cm_a * alpha0
+
     # lateral-directional maps
     aero = dict(
         CL0=CL0, CLalpha=CLa, CLq=CLq, CLde=CL_de,
-        Cm0=0.0, Cmalpha=Cm_a, Cmq=Cmq, Cmde=abs(Cm_de),  # GUI convention: positive elevator → positive pitch rate
+        Cm0=Cm0, Cmalpha=Cm_a, Cmq=Cmq, Cmde=abs(Cm_de),  # GUI convention: positive elevator → positive pitch rate
         CD0=CD0, k_ind=k_ind,
         CYbeta=d.get("CY_beta", 0.0), CYdr=d.get("CY_dr", 0.0),
         Clbeta=d.get("Cl_beta", 0.0), Clp=d.get("Cl_p", 0.0), Clr=d.get("Cl_r", 0.0), Clda=d.get("Cl_da", 0.0),
@@ -137,10 +139,15 @@ def _build_params_from_md(name: str):
     T_trim = qbar0 * S * d["CTx1"]
     T_max = 2.0 * T_trim  # 50% throttle → T_trim
 
+    # velocity components consistent with alpha0
+    u0_b = U0 * np.cos(alpha0)
+    w0_b = U0 * np.sin(alpha0)
+
     params = dict(m=m, I=I, S=S, b=b, cbar=cbar, T_max=T_max)
 
     init = dict(
-        u0=U0,
+        u0=u0_b,
+        w0=w0_b,
         h0=h0,
         theta0_rad=np.radians(d["theta0_deg"]),
     )
@@ -210,7 +217,7 @@ def forces_moments(Vb, p, q, r, u_cmd, qbar, params, aero):
 
     return Fb[0], Fb[1], Fb[2], Lb, Mb, Nb
 
-def sixdof_rhs(x, t, u_cmd, params=PARAMS, aero=AERO, wind_ned=np.zeros(3)):
+def sixdof_rhs(x, t, u_cmd, params, aero, wind_ned=np.zeros(3)):
     # State: [u,v,w,p,q,r, phi,theta,psi, N,E,D]
     u,v,w,p,q,r,phi,theta,psi,N,E,D = x
     m = params["m"]; Ixx,Iyy,Izz = params["I"]
@@ -265,13 +272,14 @@ class FlightSimulatorGUI:
         self.root.configure(bg="#f0f0f0")
 
         # time bookkeeping
-        self.dt, self.t_max, self.t = 0.1, 60.0, [0.0]
+        self.dt, self.t_max, self.t = 0.1, 300.0, [0.0]
 
         # 12-state: [u,v,w,p,q,r, phi,theta,psi, N,E,D]
         u0 = INIT0['u0']
         h0 = INIT0['h0']
         th0 = INIT0['theta0_rad']
-        self.x = np.array([[u0, 0.0, 0.0,  0.0,0.0,0.0,  0.0,th0,0.0,  0.0,0.0,-h0]]).T
+        w0 = INIT0['w0']
+        self.x = np.array([[u0, 0.0, w0,  0.0,0.0,0.0,  0.0,th0,0.0,  0.0,0.0,-h0]]).T
 
         # inputs (δa, δe, δr, throttle)
         self.u = np.array([0.0, 0.0, 0.0, 0.5])
@@ -301,8 +309,8 @@ class FlightSimulatorGUI:
         global PARAMS, AERO, INIT0
         PARAMS, AERO, INIT0 = _build_params_from_md(name)
         # reset state and histories to new condition
-        u0 = INIT0['u0']; h0 = INIT0['h0']; th0 = INIT0['theta0_rad']
-        self.x = np.array([[u0,0,0, 0,0,0, 0,th0,0, 0,0,-h0]]).T
+        u0 = INIT0['u0']; h0 = INIT0['h0']; th0 = INIT0['theta0_rad']; w0 = INIT0['w0']
+        self.x = np.array([[u0, 0.0, w0,  0.0,0.0,0.0,  0.0,th0,0.0,  0.0,0.0,-h0]]).T
         self.t = [0.0]
         # histories
         self.hist['u']=[u0]; self.hist['v']=[0.0]; self.hist['w']=[0.0]
@@ -582,7 +590,7 @@ class FlightSimulatorGUI:
                 self.u = np.array([da, de, dr, thr])
 
                 sol = odeint(sixdof_rhs, self.x[:, -1],
-                             [self.t[-1], self.t[-1]+self.dt], args=(self.u,))
+                             [self.t[-1], self.t[-1]+self.dt], args=(self.u, PARAMS, AERO))
                 self.x = np.hstack((self.x, sol[-1, :].reshape(-1,1)))
                 self.t.append(self.t[-1]+self.dt)
 
@@ -661,10 +669,7 @@ class FlightSimulatorGUI:
     def _reset_sim(self):
         # Reset to the current flight condition's start parameters
         self.running = False
-        try:
-            mode = self.fc_var.get()
-        except Exception:
-            mode = "Approach"
+        mode = self.fc_var.get()
         self._apply_condition(mode)
 
 
