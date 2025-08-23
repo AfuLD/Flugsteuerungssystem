@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.integrate import odeint
+from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -115,17 +115,31 @@ def _build_params_from_md(name: str):
     # aspect ratio & induced drag factor (assume e≈0.8)
     AR = b*b / S
     k_ind = 1.0/(np.pi*0.8*AR)
-    # set CL0 so CL(alpha0) ≈ CL1; and CD0 so CD(CL1) ≈ CD1
-    CL0 = CL1 - CLa*alpha0
-    CD0 = max(1e-3, CD1 - k_ind*(CL1**2))
+
+    # --- Trim force balance at the specified condition ---
+    # Use Roskam's condition speed/altitude to compute dynamic pressure
+    U0 = d["U_fps"] * FPS2MPS
+    h0 = d["alt_ft"] * FT2M
+    rho0 = isa_rho(h0)
+    qbar0 = 0.5*rho0*U0*U0
+
+    # Set CL so that L = W at t=0 (level trim)
+    CLtrim = W_N / (qbar0 * S)
+    CL0 = CLtrim - CLa*alpha0
+
+    # Set CD so that D = T_trim at t=0; Roskam provides CTx1 ≈ CD at trim
+    CD0 = max(1e-3, d["CTx1"] - k_ind*(CLtrim**2))
 
     Cm0 = -Cm_a * alpha0
 
     # lateral-directional maps
     aero = dict(
         CL0=CL0, CLalpha=CLa, CLq=CLq, CLde=CL_de,
-        Cm0=Cm0, Cmalpha=Cm_a, Cmq=Cmq, Cmde=abs(Cm_de),  # GUI convention: positive elevator → positive pitch rate
+        CLu=d.get("CL_u", 0.0),
+        Cm0=Cm0, Cmalpha=Cm_a, Cmq=Cmq, Cmde=abs(Cm_de),
+        Cmu=d.get("Cm_u", 0.0),  # GUI convention: positive elevator → positive pitch rate
         CD0=CD0, k_ind=k_ind,
+        CDu=d.get("CD_u", 0.0),
         CYbeta=d.get("CY_beta", 0.0), CYdr=d.get("CY_dr", 0.0),
         Clbeta=d.get("Cl_beta", 0.0), Clp=d.get("Cl_p", 0.0), Clr=d.get("Cl_r", 0.0), Clda=d.get("Cl_da", 0.0),
         Cnbeta=d.get("Cn_beta", 0.0), Cnp=d.get("Cn_p", 0.0), Cnr=d.get("Cn_r", 0.0), Cnda=d.get("Cn_da", 0.0), Cndr=d.get("Cn_dr", 0.0),
@@ -143,7 +157,7 @@ def _build_params_from_md(name: str):
     u0_b = U0 * np.cos(alpha0)
     w0_b = U0 * np.sin(alpha0)
 
-    params = dict(m=m, I=I, S=S, b=b, cbar=cbar, T_max=T_max)
+    params = dict(m=m, I=I, S=S, b=b, cbar=cbar, T_max=T_max, Uref=U0, u_trim=u0_b, alpha0=alpha0, CT_ref=d["CTx1"])
 
     init = dict(
         u0=u0_b,
@@ -178,12 +192,15 @@ def forces_moments(Vb, p, q, r, u_cmd, qbar, params, aero):
     da,de,dr,thr = u_cmd
 
     S,b,c = params["S"], params["b"], params["cbar"]
-    pb2V, qb2V, rb2V = p*b/(2*V), q*c/(2*V), r*b/(2*V)
+    Uref = params.get("Uref", V)
+    pb2V, qb2V, rb2V = p*b/(2*Uref), q*c/(2*Uref), r*b/(2*Uref)
 
-    # Coefficients
+    # Coefficients (use Uref for rate nondim and include u-derivatives for phugoid damping)
     CL = aero["CL0"] + aero["CLalpha"]*alpha + aero["CLq"]*qb2V + aero["CLde"]*de
-    CD = aero["CD0"] + aero["k_ind"]*CL*CL
-    Cm = aero["Cm0"] + aero["Cmalpha"]*alpha + aero["Cmq"]*qb2V + aero["Cmde"]*de
+    du_nd = (u - params.get("u_trim", Uref*np.cos(params.get("alpha0", 0.0)))) / Uref
+    CL += aero.get("CLu", 0.0) * du_nd
+    CD = aero["CD0"] + aero["k_ind"]*CL*CL + aero.get("CDu", 0.0) * du_nd
+    Cm = aero["Cm0"] + aero["Cmalpha"]*alpha + aero["Cmq"]*qb2V + aero["Cmde"]*de  # removed Cmu coupling to reduce throttle→pitch feedback
 
     CY = aero["CYbeta"]*beta + aero["CYdr"]*dr
     Cl = aero["Clbeta"]*beta + aero["Clp"]*pb2V + aero["Clr"]*rb2V + aero["Clda"]*da
@@ -211,7 +228,7 @@ def forces_moments(Vb, p, q, r, u_cmd, qbar, params, aero):
     Mb = Cm * qbar * S * c
     Nb = Cn * qbar * S * b
 
-    # Thrust (aligned +x_body)
+    # Thrust (aligned +x_body) — use near-constant jet thrust per throttle (avoid positive feedback with V)
     T = params["T_max"] * np.clip(thr, 0.0, 1.0)
     Fb += np.array([T, 0.0, 0.0])
 
@@ -246,19 +263,16 @@ def sixdof_rhs(x, t, u_cmd, params, aero, wind_ned=np.zeros(3)):
     phidot, thetadot, psidot = euler_rates(phi, theta, p, q, r)
 
     # Position kinematics: [Ndot,Edot,Ddot] = R_b2n * [u,v,w]
-    c,s = np.cos, np.sin
+    c, s = np.cos, np.sin
     cph, sph = c(phi), s(phi)
+    cth, sth = c(theta), s(theta)
     cps, sps = c(psi), s(psi)
-    cth = c(theta)
-    sth = -s(theta)   # flip sign so negative pitch angle (nose-down) → positive Down velocity
     Rb2n = np.array([
-        [ cth*cps,                cth*sps,               -sth ],
-        [ sph*sth*cps - cph*sps,  sph*sth*sps + cph*cps, sph*cth ],
-        [ cph*sth*cps + sph*sps,  cph*sth*sps - sph*cps, cph*cth ],
+        [ cps*cth,  cps*sth*sph - sps*cph,  cps*sth*cph + sps*sph ],
+        [ sps*cth,  sps*sth*sph + cps*cph,  sps*sth*cph - cps*sph ],
+        [   -sth,                cth*sph,                cth*cph ],
     ])
-    ned_dot = Rb2n @ np.array([u, v, w])
-    # Invert heading's effect on East: flip the E component sign
-    Ndot, Edot, Ddot = ned_dot[0], -ned_dot[1], ned_dot[2]
+    Ndot, Edot, Ddot = Rb2n @ np.array([u, v, w])
 
     return np.array([udot,vdot,wdot, pdot,qdot,rdot,
                      phidot,thetadot,psidot, Ndot,Edot,Ddot])
@@ -272,7 +286,7 @@ class FlightSimulatorGUI:
         self.root.configure(bg="#f0f0f0")
 
         # time bookkeeping
-        self.dt, self.t_max, self.t = 0.1, 300.0, [0.0]
+        self.dt, self.t_max, self.t = 0.10, 300.0, [0.0]
 
         # 12-state: [u,v,w,p,q,r, phi,theta,psi, N,E,D]
         u0 = INIT0['u0']
@@ -313,11 +327,11 @@ class FlightSimulatorGUI:
         self.x = np.array([[u0, 0.0, w0,  0.0,0.0,0.0,  0.0,th0,0.0,  0.0,0.0,-h0]]).T
         self.t = [0.0]
         # histories
-        self.hist['u']=[u0]; self.hist['v']=[0.0]; self.hist['w']=[0.0]
+        self.hist['u']=[u0]; self.hist['v']=[0.0]; self.hist['w']=[w0]
         self.hist['p']=[0.0]; self.hist['q']=[0.0]; self.hist['r']=[0.0]
         self.hist['phi']=[0.0]; self.hist['theta']=[th0]; self.hist['psi']=[0.0]
         self.hist['N']=[0.0]; self.hist['E']=[0.0]; self.hist['D']=[-h0]
-        self.hist['V']=[u0];  self.hist['h']=[h0]
+        self.hist['V']=[float(np.hypot(u0, w0))];  self.hist['h']=[h0]
         self.hist['delta_a']=[0.0]; self.hist['delta_e']=[0.0]; self.hist['delta_r']=[0.0]
         self.hist['throttle']=[50.0]
         # reset controls
@@ -582,16 +596,27 @@ class FlightSimulatorGUI:
     # ───────────── SIMULATION LOOP ─────────────────────────────────────────
     def _simulate(self):
         while True:
-            if self.running and self.t[-1] < self.t_max:
+            if not self.running:
+                time.sleep(.1)
+            elif self.t[-1] >= self.t_max:
+                self._stop_sim()
+            else:
                 da = np.radians(self.aileron.get())
                 de = np.radians(self.elevator.get())
                 dr = np.radians(self.rudder.get())
                 thr = 0.01 * self.throttle.get()
                 self.u = np.array([da, de, dr, thr])
 
-                sol = odeint(sixdof_rhs, self.x[:, -1],
-                             [self.t[-1], self.t[-1]+self.dt], args=(self.u, PARAMS, AERO))
-                self.x = np.hstack((self.x, sol[-1, :].reshape(-1,1)))
+                sol = solve_ivp(
+                    lambda t, y: sixdof_rhs(y, t, self.u, PARAMS, AERO),
+                    (self.t[-1], self.t[-1] + self.dt),
+                    self.x[:, -1],
+                    method="Radau",
+                    rtol=1e-6, atol=1e-8,
+                    max_step=self.dt
+                )
+                self.x = np.hstack((self.x, sol.y[:, -1].reshape(-1,1)))
+
                 self.t.append(self.t[-1]+self.dt)
 
                 u_b, v_b, w_b = self.x[0:3, -1]
@@ -613,7 +638,8 @@ class FlightSimulatorGUI:
                 self.hist['throttle'].append(100.0*thr)
 
                 self._update_plots()
-            time.sleep(self.dt/2)
+                time.sleep(0.01)
+
 
     # ───────────── PLOT/3-D UPDATE ────────────────────────────────────────
     def _update_plots(self):
