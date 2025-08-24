@@ -16,6 +16,7 @@ from typing import Dict, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from appdirs import system
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scipy.integrate import solve_ivp
 
@@ -327,7 +328,7 @@ class SixDOFSimulator:
         self.u_cmd = np.array([da_rad, de_rad, dr_rad, float(np.clip(throttle_01, 0.0, 1.0))])
 
     def step(self) -> None:
-        """Advance one fixed time step using Radau."""
+        """Advance one fixed time step in multiple integration steps"""
         t0 = self.t_hist[-1]
         x0 = self.x[:, -1]
 
@@ -335,7 +336,7 @@ class SixDOFSimulator:
             lambda t, y: self._rhs(y, t),
             (t0, t0 + self.dt),
             x0,
-            method="RK23",
+            method="RK45",
             rtol=1e-6,
             atol=1e-8,
             max_step=self.dt,
@@ -541,11 +542,13 @@ class FlightSimulatorGUI:
     def __init__(self, root: tk.Tk, sim: SixDOFSimulator):
         self.root = root
         self.sim = sim
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.root.title("747 Flight Dynamics Simulator")
         self.root.configure(bg="#f0f0f0")
 
         # settings
+        self.ended = False
         self.nav_window_m = 80.0
         self.running = False
         self.max_pts = int(self.sim.t_max / self.sim.dt)
@@ -558,6 +561,15 @@ class FlightSimulatorGUI:
         Thread(target=self._loop, daemon=True).start()
 
     # ——— UI: controls ————————————————————————————————————————————————
+    def _on_close(self):
+        """
+        Called once when the GUI window is closed to clean up.
+        """
+        # Example: stop simulation loop
+        self.running = False
+        self.ended = True
+        self.root.destroy()
+        self.root.quit()
 
     def _create_control_panel(self) -> None:
         lf, bf = ("Arial", 12), ("Arial", 12)
@@ -698,10 +710,8 @@ class FlightSimulatorGUI:
         self.ax3d.set(title="747 Position & Orientation (N, E, h)", xlabel="North [m]", ylabel="East [m]")
         self.ax3d.set_zlabel("Altitude h [m]")
         self.ax3d.set(xlim=(-w, w), ylim=(w, -w), zlim=(0, 2 * w))
-        try:
-            self.ax3d.set_box_aspect([1, 1, 1])
-        except Exception:
-            pass
+        self.ax3d.set_box_aspect([1, 1, 1])
+
         self.ax3d.grid(True, alpha=0.3)
         self.ax3d.view_init(elev=20, azim=45)
         self.ax3d.set_facecolor("#f5f5f5")
@@ -833,7 +843,7 @@ class FlightSimulatorGUI:
     # ——— main loop & events ————————————————————————————————————————————
 
     def _loop(self) -> None:
-        while True:
+        while not self.ended:
             while self.running and self.sim.t_hist[-1] < self.sim.t_max:
                 # controls from UI
                 da = np.radians(self.aileron.get())
@@ -847,27 +857,23 @@ class FlightSimulatorGUI:
 
                 # refresh plots
                 self._update_plots()
-            time.sleep(0.1)
+            time.sleep(0.01)
 
     def _on_condition(self, name: str) -> None:
+        self._stop()
         self.sim.reset(name)
         # reset UI controls
         for sld in (self.aileron, self.elevator, self.rudder):
             sld.set(0)
         self.throttle.set(50)
         # rebuild 3D geometry (b may have changed)
-        try:
-            for s in getattr(self, "surfs", []):
-                s.remove()
-        except Exception:
-            pass
+        for s in getattr(self, "surfs", []):
+            s.remove()
+
         self.surfs = []
         self.base_coords = []
         self.ctrl_idx = {}
-        try:
-            self._setup_plane_model()
-        except Exception:
-            pass
+        self._setup_plane_model()
         self._update_plots()
 
     # ——— plotting updates ——————————————————————————————————————————————
@@ -918,12 +924,10 @@ class FlightSimulatorGUI:
         self._update_plane_model(phi, th, ps, N, E, h, da, de, dr)
 
         # center nav window
-        try:
-            w = self.nav_window_m
-            self.ax3d.set(xlim=(N - w, N + w), ylim=(E + w, E - w), zlim=(max(0.0, h - w), h + w))
-            self.ax3d.set_box_aspect([1, 1, 1])
-        except Exception:
-            pass
+        w = self.nav_window_m
+        self.ax3d.set(xlim=(N - w, N + w), ylim=(E + w, E - w), zlim=(max(0.0, h - w), h + w))
+        self.ax3d.set_box_aspect([1, 1, 1])
+
 
         self.canvas.draw_idle()
         self.canvas.flush_events()
@@ -941,7 +945,7 @@ class FlightSimulatorGUI:
         self.stop_b.config(state="disabled")
 
     def _reset(self) -> None:
-        self.running = False
+        self._stop()
         self._on_condition(self.fc_var.get())
 
 
